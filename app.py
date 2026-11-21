@@ -2,7 +2,9 @@
 # Study Buddy AI - the Streamlit interface.
 # Run with:  streamlit run app.py
 
+import os
 import re
+import uuid
 from datetime import date
 
 import streamlit as st
@@ -232,22 +234,37 @@ def short_label(title, limit=26):
     return title if len(title) <= limit else title[:limit].rstrip() + "..."
 
 
+def get_owner():
+    """Online: every visitor gets a private ID that is kept in the page link.
+    On the laptop (MULTI_USER is not set): one owner, so old chats stay visible."""
+    if os.getenv("MULTI_USER", "").lower() != "true":
+        return db.DEFAULT_OWNER
+    visitor = st.query_params.get("u")
+    if not visitor or not re.fullmatch(r"[a-f0-9]{16}", visitor):
+        visitor = uuid.uuid4().hex[:16]
+        st.query_params["u"] = visitor
+    return visitor
+
+
 def init_state():
     """Sets up the app's memory the first time the page loads."""
     if "ready" in st.session_state:
         return
 
     db.init_db()
+    st.session_state.owner = get_owner()
 
-    language = db.get_setting("language", "English")
-    level = db.get_setting("level", "Beginner")
+    language = db.get_setting("language", "English", owner=st.session_state.owner)
+    level = db.get_setting("level", "Beginner", owner=st.session_state.owner)
 
     st.session_state.page = "home"
     st.session_state.current_chat_id = None
     st.session_state.mode_sel = "Ask a Question"
     st.session_state.language_sel = language if language in LANGUAGES else "English"
     st.session_state.level_sel = level if level in LEVELS else "Beginner"
-    st.session_state.dark_mode = db.get_setting("dark_mode", "False") == "True"
+    st.session_state.dark_mode = (
+        db.get_setting("dark_mode", "False", owner=st.session_state.owner) == "True"
+    )
     st.session_state.pending_doc = None
     st.session_state.nonce = 0
     st.session_state.ready = True
@@ -256,9 +273,10 @@ def init_state():
 # ---------- Button actions (callbacks) ----------
 
 def save_prefs():
-    db.set_setting("language", st.session_state.language_sel)
-    db.set_setting("level", st.session_state.level_sel)
-    db.set_setting("dark_mode", st.session_state.dark_mode)
+    owner = st.session_state.owner
+    db.set_setting("language", st.session_state.language_sel, owner=owner)
+    db.set_setting("level", st.session_state.level_sel, owner=owner)
+    db.set_setting("dark_mode", st.session_state.dark_mode, owner=owner)
 
 
 def go_home():
@@ -278,7 +296,7 @@ def new_chat(mode=None):
 
 
 def open_chat(chat_id):
-    chat = db.get_chat(chat_id)
+    chat = db.get_chat(chat_id, owner=st.session_state.owner)
     if not chat:
         return
     st.session_state.page = "chat"
@@ -371,7 +389,7 @@ def render_sidebar():
             label_visibility="collapsed",
         )
 
-        chats = db.list_chats()
+        chats = db.list_chats(owner=st.session_state.owner)
         st.markdown('<div class="section-label">Recent chats</div>', unsafe_allow_html=True)
         if not chats:
             st.caption("Your conversations are saved here automatically.")
@@ -411,7 +429,7 @@ def render_home():
         unsafe_allow_html=True,
     )
 
-    stats = db.get_stats()
+    stats = db.get_stats(owner=st.session_state.owner)
     columns = st.columns(3)
     tiles = [
         (stats["chats"], "Saved conversations"),
@@ -525,7 +543,9 @@ def handle_user_message(chat, messages, prompt):
 
     # Save only after the AI answered successfully
     if chat is None:
-        chat_id = db.create_chat(clean_title(prompt), mode, language, level)
+        chat_id = db.create_chat(
+            clean_title(prompt), mode, language, level, owner=st.session_state.owner
+        )
         pending = st.session_state.pending_doc
         if pending:
             db.set_document(chat_id, pending["name"], pending["text"])
@@ -542,7 +562,7 @@ def handle_user_message(chat, messages, prompt):
 
 def render_chat():
     chat_id = st.session_state.current_chat_id
-    chat = db.get_chat(chat_id) if chat_id else None
+    chat = db.get_chat(chat_id, owner=st.session_state.owner) if chat_id else None
 
     if chat_id and chat is None:  # the chat was deleted
         go_home()

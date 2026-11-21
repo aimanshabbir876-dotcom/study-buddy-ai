@@ -1,6 +1,7 @@
 # database.py
 # Saves chats, messages, uploaded-file text and settings in a local SQLite file.
 # SQLite is built into Python, so nothing extra needs to be installed.
+# Each chat has an "owner" so that different visitors only see their own chats.
 
 import sqlite3
 from contextlib import contextmanager
@@ -9,6 +10,9 @@ from pathlib import Path
 
 # The database file is created next to this script
 DB_PATH = Path(__file__).parent / "study_buddy.db"
+
+# Owner used for chats that existed before owners were added (and for local use)
+DEFAULT_OWNER = "local"
 
 
 @contextmanager
@@ -42,7 +46,8 @@ def init_db():
                 doc_name   TEXT,
                 doc_text   TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                owner      TEXT NOT NULL DEFAULT 'local'
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -60,37 +65,48 @@ def init_db():
             );
             """
         )
+        # Older databases do not have the "owner" column yet, so add it.
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(chats)")]
+        if "owner" not in columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN owner TEXT NOT NULL DEFAULT 'local'")
 
 
 # ---------- Chats ----------
 
-def create_chat(title, mode, language, level):
-    """Creates a new chat and returns its id."""
+def create_chat(title, mode, language, level, owner=DEFAULT_OWNER):
+    """Creates a new chat for an owner and returns its id."""
     timestamp = now()
     with get_connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO chats (title, mode, language, level, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (title, mode, language, level, timestamp, timestamp),
+            "INSERT INTO chats (title, mode, language, level, created_at, updated_at, owner) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (title, mode, language, level, timestamp, timestamp, owner),
         )
         return cursor.lastrowid
 
 
-def list_chats():
-    """Returns all chats, newest activity first (without the big file text)."""
+def list_chats(owner=DEFAULT_OWNER):
+    """Returns the owner's chats, newest activity first (without the big file text)."""
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT id, title, mode, language, level, doc_name, created_at, updated_at "
-            "FROM chats ORDER BY updated_at DESC, id DESC"
+            "FROM chats WHERE owner = ? ORDER BY updated_at DESC, id DESC",
+            (owner,),
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def get_chat(chat_id):
-    """Returns one chat (including its file text) or None."""
+def get_chat(chat_id, owner=None):
+    """Returns one chat (including its file text) or None.
+    If an owner is given, the chat is returned only when it belongs to that owner."""
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    chat = dict(row)
+    if owner is not None and chat["owner"] != owner:
+        return None
+    return chat
 
 
 def rename_chat(chat_id, new_title):
@@ -153,30 +169,41 @@ def set_document(chat_id, doc_name, doc_text):
 
 # ---------- Settings (language, level, dark mode) ----------
 
-def get_setting(key, default=None):
+def _setting_key(key, owner):
+    """Settings of the default owner keep their old names; others get a prefix."""
+    return key if owner == DEFAULT_OWNER else f"{owner}:{key}"
+
+
+def get_setting(key, default=None, owner=DEFAULT_OWNER):
     with get_connection() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (_setting_key(key, owner),)
+        ).fetchone()
     return row["value"] if row else default
 
 
-def set_setting(key, value):
+def set_setting(key, value, owner=DEFAULT_OWNER):
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
+            (_setting_key(key, owner), str(value)),
         )
 
 
 # ---------- Statistics for the home page ----------
 
-def get_stats():
+def get_stats(owner=DEFAULT_OWNER):
     with get_connection() as conn:
-        chats = conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
+        chats = conn.execute(
+            "SELECT COUNT(*) FROM chats WHERE owner = ?", (owner,)
+        ).fetchone()[0]
         questions = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE role = 'user'"
+            "SELECT COUNT(*) FROM messages m JOIN chats c ON c.id = m.chat_id "
+            "WHERE m.role = 'user' AND c.owner = ?",
+            (owner,),
         ).fetchone()[0]
         files = conn.execute(
-            "SELECT COUNT(*) FROM chats WHERE doc_name IS NOT NULL"
+            "SELECT COUNT(*) FROM chats WHERE doc_name IS NOT NULL AND owner = ?", (owner,)
         ).fetchone()[0]
     return {"chats": chats, "questions": questions, "files": files}
